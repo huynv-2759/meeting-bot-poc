@@ -20,9 +20,19 @@ chromium.use(stealth);
 
     const userDataDir = path.join(__dirname, 'tmp-chrome-profile');
 
+    // --- BƯỚC CHUẨN BỊ: Dọn dẹp profile cũ để tránh lỗi "Resource Busy" hoặc Treo ---
+    if (fs.existsSync(userDataDir)) {
+        try {
+            console.log('🧹 Đang dọn dẹp profile cũ...');
+            fs.rmSync(userDataDir, { recursive: true, force: true });
+        } catch (e) {
+            console.log('⚠️ Cảnh báo: Không thể xóa profile cũ. Hãy đảm bảo không có Chrome ngầm nào đang chạy.');
+        }
+    }
+
     try {
         const context = await chromium.launchPersistentContext(userDataDir, {
-            headless: false, // Phải mở UI để lừa Google đây là người dùng thật
+            headless: false, // Để false để quan sát và vượt bot dễ hơn
             channel: 'chrome', 
             args: [
                 '--disable-blink-features=AutomationControlled',
@@ -32,8 +42,15 @@ chromium.use(stealth);
 
         const page = context.pages().length > 0 ? context.pages()[0] : await context.newPage();
 
+        // Nới lỏng timeout mặc định cho toàn page
+        page.setDefaultTimeout(60000);
+
         console.log('🌐 Đang vào trang đăng nhập Google...');
-        await page.goto('https://accounts.google.com/');
+        // Sử dụng domcontentloaded để tránh bị kẹt do các script tracking của Google
+        await page.goto('https://accounts.google.com/', { 
+            waitUntil: 'domcontentloaded', 
+            timeout: 60000 
+        });
 
         // --- BƯỚC 1: NHẬP EMAIL ---
         console.log(`📧 Đang nhập Email: ${email}...`);
@@ -43,79 +60,75 @@ chromium.use(stealth);
 
         // --- BƯỚC 2: NHẬP PASSWORD ---
         console.log('🔑 Đang chờ form nhập mật khẩu...');
-        await page.waitForSelector('input[type="password"]', { state: 'visible', timeout: 15000 });
-        await page.waitForTimeout(1500); // Chờ hiệu ứng chuyển cảnh của Google hoàn tất
+        await page.waitForSelector('input[type="password"]', { state: 'visible' });
+        await page.waitForTimeout(2000); // Chờ ổn định giao diện
         
         console.log('⌨️ Đang gõ Mật khẩu...');
         await page.locator('input[type="password"]').pressSequentially(password, { delay: 100 });
         await page.keyboard.press('Enter');
 
         // --- BƯỚC 3: XỬ LÝ CÁC BÀI KIỂM TRA BẢO MẬT (RECOVERY EMAIL) ---
-        console.log('⏳ Đang chờ Google duyệt... (Đang theo dõi màn hình)');
+        console.log('⏳ Đang theo dõi màn hình để xử lý xác minh (nếu có)...');
         
         let isLoggedIn = false;
-        let timeout = 60; // Chờ tối đa 60 giây (mỗi giây quét 1 lần)
+        let timeoutCount = 60; 
         
-        while (timeout > 0 && !isLoggedIn) {
+        while (timeoutCount > 0 && !isLoggedIn) {
             const currentUrl = page.url();
             
-            // Tình huống 1: Đã đăng nhập thành công mượt mà
+            // Kiểm tra nếu đã vào được trang quản lý tài khoản hoặc trang chủ Google
             if (currentUrl.includes('myaccount.google.com') || currentUrl.includes('google.com/?')) {
                 isLoggedIn = true;
                 break;
             }
 
-            // Tình huống 2: Bị vướng màn hình đòi Xác minh
             try {
-                // 2.1: Nếu Google bắt CHỌN phương thức xác minh (Màn hình liệt kê các lựa chọn)
-                // Thuộc tính data-challengetype="12" hoặc "13" thường đại diện cho Email khôi phục
+                // 2.1: Nếu Google bắt CHỌN phương thức xác minh
                 const recoveryOption = await page.$('div[data-challengetype="12"], div[data-challengetype="13"]'); 
                 if (recoveryOption) {
-                    console.log('🛡️ Bị Google chặn! Đang tự động click chọn "Xác nhận email khôi phục"...');
+                    console.log('🛡️ Phát hiện màn hình chọn xác minh. Đang chọn "Xác nhận email khôi phục"...');
                     await recoveryOption.click();
-                    await page.waitForTimeout(2000); // Chờ load trang mới
+                    await page.waitForTimeout(3000);
                 }
 
-                // 2.2: Nếu đang ở màn hình Ô NHẬP Email khôi phục (Input field)
+                // 2.2: Nếu đang ở màn hình Ô NHẬP Email khôi phục
                 const recoveryInput = await page.$('input[name="knowledgePreregisteredEmailResponse"], input[type="email"]');
-                if (recoveryInput) {
-                    const isVisible = await recoveryInput.isVisible();
-                    if (isVisible) {
-                        if (recoveryEmail) {
-                            console.log(`🛡️ Đang tự động điền Email khôi phục: ${recoveryEmail}...`);
-                            // Focus và gõ email khôi phục
-                            await recoveryInput.focus();
-                            await recoveryInput.pressSequentially(recoveryEmail, { delay: 100 });
-                            await page.keyboard.press('Enter');
-                            
-                            // Ngủ 5 giây để đợi Google xác thực
-                            await page.waitForTimeout(5000); 
-                        } else {
-                            console.log('⚠️ Google đòi Email khôi phục nhưng bạn CHƯA CẤU HÌNH GOOGLE_RECOVERY_EMAIL trong .env!');
-                            break; // Thoát vòng lặp vì không có email để nhập
-                        }
+                if (recoveryInput && await recoveryInput.isVisible()) {
+                    if (recoveryEmail) {
+                        console.log(`🛡️ Đang tự động điền Email khôi phục: ${recoveryEmail}...`);
+                        await recoveryInput.focus();
+                        await recoveryInput.pressSequentially(recoveryEmail, { delay: 100 });
+                        await page.keyboard.press('Enter');
+                        await page.waitForTimeout(5000); 
+                    } else {
+                        console.log('⚠️ Google yêu cầu Email khôi phục nhưng bạn chưa cấu hình trong .env!');
+                        break;
                     }
                 }
             } catch (e) {
-                // Bỏ qua lỗi ngầm trong lúc DOM đang load
+                // Bỏ qua lỗi selector trong khi chuyển trang
             }
 
-            await page.waitForTimeout(1000);
-            timeout--;
+            await page.waitForTimeout(1500);
+            timeoutCount--;
         }
 
         // --- BƯỚC 4: CHỐT KẾT QUẢ ---
         if (isLoggedIn) {
-            console.log('✅ Đăng nhập thành công! Đang lưu Session...');
+            console.log('✅ Đăng nhập thành công!');
             await context.storageState({ path: 'auth.json' });
-            console.log('🎉 XONG! Đã lưu file auth.json. Sẵn sàng đem Bot đi chiến đấu!');
+            console.log('🎉 Đã lưu file auth.json thành công.');
         } else {
-            console.error('❌ THẤT BẠI: Hết thời gian chờ hoặc Google chặn vì lý do khác (Vd: Bắt nhập SĐT). Hãy xem UI trình duyệt để biết chi tiết!');
+            console.error('❌ THẤT BẠI: Quá thời gian chờ hoặc bị chặn bởi yếu tố bảo mật khác (như SĐT).');
         }
 
-        // Đóng trình duyệt và xóa dọn rác
+        // Đóng trình duyệt
         await context.close();
-        fs.rmSync(userDataDir, { recursive: true, force: true });
+        
+        // Dọn dẹp sau khi chạy xong
+        if (fs.existsSync(userDataDir)) {
+            fs.rmSync(userDataDir, { recursive: true, force: true });
+        }
 
     } catch (error) {
         console.error('❌ LỖI HỆ THỐNG:', error.message);
